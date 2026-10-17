@@ -1,0 +1,12 @@
+<svg width="96" height="96" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">matchboxd logo</title>
+  <desc id="desc">Three overlapping watchlist cards with a shared play symbol.</desc>
+  <rect width="96" height="96" rx="22" fill="#111827"/>
+  <rect x="20" y="25" width="34" height="46" rx="8" transform="rotate(-10 20 25)" fill="#00E054"/>
+  <rect x="31" y="19" width="34" height="50" rx="8" fill="#FF8000"/>
+  <rect x="44" y="25" width="34" height="46" rx="8" transform="rotate(10 44 25)" fill="#40BCF4"/>
+  <path d="M40 36.6C40 34.9 41.8 33.8 43.3 34.7L62.6 45.9C64 46.7 64 48.8 62.6 49.6L43.3 60.8C41.8 61.7 40 60.6 40 58.9V36.6Z" fill="#111827"/>
+  <circle cx="30" cy="79" r="3.5" fill="#00E054"/>
+  <circle cx="48" cy="79" r="3.5" fill="#FF8000"/>
+  <circle cx="66" cy="79" r="3.5" fill="#40BCF4"/>
+</svg>

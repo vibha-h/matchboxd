@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>matchboxd</title>
+    <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/" aria-label="matchboxd home">
+        <img class="brand-logo" src="/static/logo.svg" alt="" width="48" height="48">
+        <span class="brand-name">matchboxd</span>
+      </a>
+    </header>
+    <main>
+      <section class="description">
+        <p>Enter two or more Letterboxd usernames (e.g. <em>username</em>). Click the + to add more fields. Once at least two usernames are filled, click "Shared watchlist" to find films appearing in all users' watchlists.</p>
+      </section>
+
+      <section class="form">
+        <div id="inputs" class="inputs">
+          <div class="input-row">
+            <label>username 1</label>
+            <input type="text" class="username-input" data-index="1" autocomplete="off">
+            <div class="error" aria-live="polite"></div>
+          </div>
+          <div class="input-row">
+            <label>username 2</label>
+            <input type="text" class="username-input" data-index="2" autocomplete="off">
+            <div class="error" aria-live="polite"></div>
+          </div>
+        </div>
+        <button id="add" class="icon-btn" aria-label="Add username">+</button>
+        <button id="submit" class="primary" disabled>Shared watchlist</button>
+      </section>
+
+      <section id="results" class="results" hidden>
+        <h2>Shared Films</h2>
+        <div id="counts"></div>
+        <ul id="shared-list"></ul>
+      </section>
+
+      <section id="status" class="status" aria-live="polite"></section>
+    </main>
+
+    <script src="/static/script.js"></script>
+  </body>
+</html>
