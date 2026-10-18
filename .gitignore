@@ -27,5 +27,7 @@ Thumbs.db
 .coverage
 htmlcov/
 
+test_app.py
+
 # Local logs
 *.log

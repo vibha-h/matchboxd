@@ -12,6 +12,9 @@ app = Flask(__name__)
 LETTERBOXD_BASE = "https://letterboxd.com"
 # Use a realistic browser User-Agent to avoid lightweight bot responses that may omit content
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+REQUESTS_SESSION = requests.Session()
+POSTER_CACHE = {}
+POSTER_CACHE_LOCK = threading.Lock()
 
 # Alternative headers to try if initial fetch returns empty film lists
 ALT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
@@ -248,7 +251,131 @@ def scrape_watchlist_full(username: str, max_pages: int = 50, pause_between: flo
     return films, logs
 
 
-def scrape_user(username, max_pages=200, pause_between=0.2):
+def _normalize_poster_url(poster):
+    if not poster:
+        return None
+    poster = poster.strip()
+    if not poster:
+        return None
+    if poster.startswith('//'):
+        poster = 'https:' + poster
+    if poster.startswith('http') and (' ' in poster or ',' in poster):
+        parts = poster.split(',')
+        first = parts[0].strip().split()[0].strip()
+        poster = first
+    if poster.startswith('http') and '?v=' in poster:
+        poster = poster.split('?v=')[0]
+    return poster or None
+
+
+def _fetch_film_poster(film_url: str):
+    """Fetch the real poster URL from Letterboxd's film-page JSON-LD metadata.
+    The watchlist page often exposes only the empty placeholder poster, while the film page's
+    "image" field contains the real poster URL.
+    """
+    if not film_url:
+        return None
+
+    normalized_url = film_url.strip().rstrip('/')
+    with POSTER_CACHE_LOCK:
+        if normalized_url in POSTER_CACHE:
+            return POSTER_CACHE[normalized_url]
+
+    try:
+        r = REQUESTS_SESSION.get(film_url, headers=HEADERS, timeout=12)
+        if r.status_code != 200:
+            with POSTER_CACHE_LOCK:
+                POSTER_CACHE[normalized_url] = None
+            return None
+        text = r.text
+
+        # Prefer the film page's JSON-LD "image" field; this is the reliable source for the actual poster.
+        m = re.search(r'"image"\s*:\s*"(https://[^"\\]+)"', text)
+        if m:
+            poster = m.group(1)
+            poster = _normalize_poster_url(poster)
+            if poster and 'empty-poster' not in poster:
+                with POSTER_CACHE_LOCK:
+                    POSTER_CACHE[normalized_url] = poster
+                return poster
+
+        # Last fallback: search the page source for direct resized film-poster URLs.
+        m2 = re.search(r'https://a\.ltrbxd\.com/resized/film-poster[^"\'\s>]+', text)
+        if m2:
+            poster = m2.group(0)
+            poster = _normalize_poster_url(poster)
+            if poster and 'empty-poster' not in poster:
+                with POSTER_CACHE_LOCK:
+                    POSTER_CACHE[normalized_url] = poster
+                return poster
+
+        with POSTER_CACHE_LOCK:
+            POSTER_CACHE[normalized_url] = None
+        return None
+    except Exception:
+        with POSTER_CACHE_LOCK:
+            POSTER_CACHE[normalized_url] = None
+        return None
+
+
+def _extract_film_entries_from_items(items):
+    """Turn parsed poster items into film entries, but defer expensive poster fetches.
+    This keeps the page fetch fast and lets poster URLs be resolved in parallel.
+    """
+    entries = []
+    for d in items:
+        title = None
+        href = None
+        poster = None
+
+        if d.name == 'div':
+            title = d.get('data-item-name') or d.get('data-title') or d.get('data-item-title')
+            href = d.get('data-item-link') or d.get('data-url')
+            img = d.select_one('img')
+            if img:
+                poster = img.get('srcset') or img.get('src')
+        elif d.name == 'a':
+            href = d.get('href')
+            img = d.select_one('img')
+            if img:
+                poster = img.get('srcset') or img.get('src')
+            title = d.get('title') or (img.get('alt') if img else None)
+
+        if href and href.startswith('/'):
+            link = LETTERBOXD_BASE + href
+        else:
+            link = href
+
+        poster = _normalize_poster_url(poster)
+        if title and link and '/film/' in link:
+            entry = {'title': title.strip(), 'link': link, 'poster': poster}
+            if not poster or 'empty-poster' in poster:
+                entry['needs_poster_fetch'] = True
+            entries.append(entry)
+    return entries
+
+
+def _resolve_page_posters(entries):
+    """Resolve poster URLs for entries in parallel, preserving cached results."""
+    if not entries:
+        return []
+
+    pending = [entry for entry in entries if entry.get('needs_poster_fetch')]
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(pending)))) as ex:
+            futures = {ex.submit(_fetch_film_poster, entry['link']): entry for entry in pending}
+            for fut in as_completed(futures):
+                entry = futures[fut]
+                result = fut.result()
+                entry['poster'] = result or entry.get('poster')
+                entry.pop('needs_poster_fetch', None)
+
+    for entry in entries:
+        entry.pop('needs_poster_fetch', None)
+    return entries
+
+
+def scrape_user(username, max_pages=200, pause_between=0.05):
     """Scrape a user's watchlist with per-page logging.
     Returns {'films': [film_objs], 'pages': [page_logs]} or {'error': ...}
     Each film_obj: {'title','link','poster'}
@@ -270,84 +397,23 @@ def scrape_user(username, max_pages=200, pause_between=0.2):
                 return {'error': f'user {username} was not found', 'pages': pages}
 
             soup = BeautifulSoup(r.text, 'html.parser')
-            # Common letterboxd poster components
             items = soup.select('div.react-component[data-component-class="LazyPoster"]') or []
             if not items:
                 items = soup.select('li.poster-container') or []
             if not items:
-                # Some pages render posters inside anchors with class 'film-poster'
                 items = soup.select('a[href*="/film/"]') or []
 
-            page_films = []
-            for d in items:
-                # support both poster divs and anchor tags
-                title = None
-                href = None
-                poster = None
-                # attributes on a LazyPoster div
-                if d.name == 'div':
-                    title = d.get('data-item-name') or d.get('data-title') or d.get('data-item-title')
-                    href = d.get('data-item-link') or d.get('data-url')
-                    img = d.select_one('img')
-                    if img:
-                        poster = img.get('srcset') or img.get('src')
-                elif d.name == 'a':
-                    href = d.get('href')
-                    # find nested img or aria-label/title
-                    img = d.select_one('img')
-                    if img:
-                        poster = img.get('srcset') or img.get('src')
-                    title = d.get('title') or (img.get('alt') if img else None)
-                # normalize href to absolute
-                if href and href.startswith('/'):
-                    link = LETTERBOXD_BASE + href
-                else:
-                    link = href
-                if poster and poster.startswith('//'):
-                    poster = 'https:' + poster
-                # clean poster query
-                if poster and '?v=' in poster:
-                    poster = poster.split('?v=')[0]
-                if title and link and '/film/' in link:
-                    page_films.append({'title': title.strip(), 'link': link, 'poster': poster})
-
+            page_films = _resolve_page_posters(_extract_film_entries_from_items(items))
             found = len(page_films)
             pages.append({'page': page, 'url': url, 'status': r.status_code, 'found': found})
 
             if not page_films:
-                # try alt headers once
                 try:
                     r2 = requests.get(url, headers=ALT_HEADERS, timeout=10)
                     if r2.status_code == 200:
                         soup2 = BeautifulSoup(r2.text, 'html.parser')
                         items2 = soup2.select('div.react-component[data-component-class="LazyPoster"]') or soup2.select('li.poster-container') or soup2.select('a[href*="/film/"]')
-                        page_films2 = []
-                        for d in items2:
-                            title = None
-                            href = None
-                            poster = None
-                            if d.name == 'div':
-                                title = d.get('data-item-name') or d.get('data-title') or d.get('data-item-title')
-                                href = d.get('data-item-link') or d.get('data-url')
-                                img = d.select_one('img')
-                                if img:
-                                    poster = img.get('srcset') or img.get('src')
-                            elif d.name == 'a':
-                                href = d.get('href')
-                                img = d.select_one('img')
-                                if img:
-                                    poster = img.get('srcset') or img.get('src')
-                                title = d.get('title') or (img.get('alt') if img else None)
-                            if href and href.startswith('/'):
-                                link = LETTERBOXD_BASE + href
-                            else:
-                                link = href
-                            if poster and poster.startswith('//'):
-                                poster = 'https:' + poster
-                            if poster and '?v=' in poster:
-                                poster = poster.split('?v=')[0]
-                            if title and link and '/film/' in link:
-                                page_films2.append({'title': title.strip(), 'link': link, 'poster': poster})
+                        page_films2 = _resolve_page_posters(_extract_film_entries_from_items(items2))
                         if page_films2:
                             pages.append({'page': page, 'url': url, 'status': r2.status_code, 'found': len(page_films2), 'note': 'alt-ua'})
                             films.extend(page_films2)
@@ -365,7 +431,6 @@ def scrape_user(username, max_pages=200, pause_between=0.2):
     if not films:
         return {'error': f"user {username}'s watchlist is empty", 'pages': pages}
 
-    # store in USER_CACHE
     try:
         USER_CACHE[username] = {'films': films, 'pages': pages, 'ts': time.time()}
     except Exception:
@@ -465,13 +530,17 @@ def shared_watchlist():
         first_map = user_watchlists.get(first, {})
         for key in sorted(shared_keys):
             title = None
-            # prefer title from first map, else any
+            poster = None
+            # prefer title and poster from first map, else any
             if key in first_map:
                 title = first_map[key].get('title')
+                poster = first_map[key].get('poster')
             else:
                 for u in usernames:
                     if key in user_watchlists.get(u, {}):
-                        title = user_watchlists[u][key].get('title')
+                        film = user_watchlists[u][key]
+                        title = film.get('title')
+                        poster = film.get('poster')
                         break
             # build a full letterboxd URL for the film key when possible
             url = None
@@ -484,7 +553,7 @@ def shared_watchlist():
                     url = LETTERBOXD_BASE + '/' + key.lstrip('/')
             except Exception:
                 url = None
-            shared.append({'title': title or key, 'url': url})
+            shared.append({'title': title or key, 'url': url, 'poster': poster})
 
     counts = {u: len(user_watchlists.get(u, {})) for u in usernames}
 
@@ -509,6 +578,8 @@ def clear_cache():
                 if key in WATCHLIST_CACHE:
                     del WATCHLIST_CACHE[key]
                     cleared.append(key)
+    with POSTER_CACHE_LOCK:
+        POSTER_CACHE.clear()
     return jsonify({'cleared': cleared})
 
 
